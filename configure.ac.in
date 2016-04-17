@@ -99,6 +99,7 @@ XDT_CHECK_PACKAGE([LIBXFCE4KBD_PRIVATE], [libxfce4kbd-private-2], [4.9.0])
 XDT_CHECK_PACKAGE([XFCONF], [libxfconf-0], [4.9.0])
 XDT_CHECK_PACKAGE([DBUS_GLIB], [dbus-glib-1], [0.84])
 XDT_CHECK_PACKAGE([FONTCONFIG], [fontconfig], [2.6.0])
+XDT_CHECK_PACKAGE([FIREJAILUTIL], [libexechelperutils], [0.9.29])
 
 XDT_CHECK_PACKAGE([XI], [xi], [1.2.0], [],
 [

@@ -41,6 +41,7 @@ static const GDebugKey dbg_keys[] =
     { "accessibility", XFSD_DEBUG_ACCESSIBILITY },
     { "pointers", XFSD_DEBUG_POINTERS },
     { "displays", XFSD_DEBUG_DISPLAYS },
+    { "firejail", XFSD_DEBUG_FIREJAIL },
 };
 
 

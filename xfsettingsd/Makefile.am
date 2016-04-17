@@ -19,6 +19,8 @@ xfsettingsd_SOURCES = \
 	debug.h \
 	clipboard-manager.c \
 	clipboard-manager.h \
+	firejail-sandboxes.c \
+	firejail-sandboxes.h \
 	gtk-decorations.c \
 	gtk-decorations.h \
 	keyboards.c \
@@ -44,6 +46,7 @@ xfsettingsd_CFLAGS = \
 	$(GIO_CFLAGS) \
 	$(DBUS_GLIB_CFLAGS) \
 	$(XFCONF_CFLAGS) \
+	$(FIREJAILUTIL_CFLAGS) \
 	$(LIBXFCE4UTIL_CFLAGS) \
 	$(LIBXFCE4UI_CFLAGS) \
 	$(LIBXFCE4KBD_PRIVATE_CFLAGS) \
@@ -66,6 +69,7 @@ xfsettingsd_LDADD = \
 	$(GIO_LIBS) \
 	$(DBUS_GLIB_LIBS) \
 	$(XFCONF_LIBS) \
+	$(FIREJAILUTIL_LIBS) \
 	$(LIBXFCE4UTIL_LIBS) \
 	$(LIBXFCE4UI_LIBS) \
 	$(LIBXFCE4KBD_PRIVATE_LIBS) \

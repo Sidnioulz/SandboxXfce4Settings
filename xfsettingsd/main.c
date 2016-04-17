@@ -58,6 +58,7 @@
 #include "workspaces.h"
 #include "clipboard-manager.h"
 #include "gtk-decorations.h"
+#include "firejail-sandboxes.h"
 #include "xsettings.h"
 
 #ifdef HAVE_XRANDR
@@ -166,6 +167,7 @@ main (gint argc, gchar **argv)
 #ifdef HAVE_XRANDR
     GObject              *displays_helper;
 #endif
+    GObject              *firejail_helper;
     GObject              *workspaces_helper;
     guint                 i;
     const gint            signums[] = { SIGQUIT, SIGTERM };
@@ -294,6 +296,7 @@ main (gint argc, gchar **argv)
 #ifdef HAVE_XRANDR
     displays_helper = g_object_new (XFCE_TYPE_DISPLAYS_HELPER, NULL);
 #endif
+    firejail_helper = g_object_new (XFCE_TYPE_SANDBOX_POLLER, NULL);
     pointer_helper = g_object_new (XFCE_TYPE_POINTERS_HELPER, NULL);
     keyboards_helper = g_object_new (XFCE_TYPE_KEYBOARDS_HELPER, NULL);
     accessibility_helper = g_object_new (XFCE_TYPE_ACCESSIBILITY_HELPER, NULL);
@@ -336,6 +339,7 @@ main (gint argc, gchar **argv)
 #ifdef HAVE_XRANDR
     g_object_unref (G_OBJECT (displays_helper));
 #endif
+    g_object_unref (G_OBJECT (firejail_helper));
     g_object_unref (G_OBJECT (pointer_helper));
     g_object_unref (G_OBJECT (keyboards_helper));
     g_object_unref (G_OBJECT (accessibility_helper));
