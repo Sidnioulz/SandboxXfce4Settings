@@ -672,22 +672,15 @@ xfce_sandbox_process_apply_workspace_prop (XfceSandboxProcess *proc,
 
     xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Applying property '%s' to workspace %d", property_name, proc->ws_number);
 
-    printf ("1\n");
-    //TODO FIND OUT WHY THIS FAILED!!!!!
-    //FIXME
-
     key = strrchr (property_name, '/');
     g_return_val_if_fail (key != NULL, FALSE);
 
     key++;
-    printf ("2 %s\n", key);
 
     /* find out if the modified property is managed by xfsettingsd, if so, build a command */
     if (g_strcmp0 (key, "bandwidth_download") == 0 || g_strcmp0 (key, "bandwidth_upload") == 0)
     {
-    printf ("3\n");
       xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Network property, about to execute Firejail");
-    printf ("4\n");
       argv = g_malloc0 (sizeof (char *) * 7);
       argv[0] = g_strdup ("firejail");
       argv[1] = g_strdup_printf ("--bandwidth=%s", proc->name);
@@ -696,47 +689,37 @@ xfce_sandbox_process_apply_workspace_prop (XfceSandboxProcess *proc,
       argv[4] = g_strdup_printf ("%d", xfce_workspace_download_speed (proc->ws_number));
       argv[5] = g_strdup_printf ("%d", xfce_workspace_upload_speed (proc->ws_number));
       argv[6] = NULL;
-      
-    printf ("5\n");
     }
     else if (g_strcmp0 (key, "proxy_ip") == 0)
     {
-    printf ("B3\n");
       g_info ("Proxy IP setting is not yet supported for Firejail sandboxes. Cannot update proxy IP for workspace '%s'", proc->name);
     } 
     else if (g_strcmp0 (key, "proxy_port") == 0)
     {
-    printf ("C3\n");
       g_info ("Proxy port setting is not yet supported for Firejail sandboxes. Cannot update proxy port for workspace '%s'", proc->name);    
     }
 
-    printf ("6\n");
     /* if there's no command to execute, just leave now */
     if (!argv)
       return TRUE;
-    printf ("7\n");
 
     /* clean up path in the environment so we're confident the sandbox properly set up */
     for (n = 0; environ && environ[n] != NULL; ++n);
     envp = g_new0 (gchar *, n + 2);
     for (n_envp = n = 0; environ[n] != NULL; ++n)
     {
-    printf ("8\n");
       if (strncmp (environ[n], "DESKTOP_STARTUP_ID", 18) != 0
           && strncmp (environ[n], "PATH", 4) != 0)
         envp[n_envp++] = environ[n];
     }
     envp[n_envp++] = new_path = g_strdup ("PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin");
 
-    printf ("9\n");
     for (n = 0; argv[n]; n++)
       xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "argv[%d] -> %s", n, argv[n]);
     succeeded = g_spawn_async (NULL, argv, envp, G_SPAWN_SEARCH_PATH_FROM_ENVP, NULL, NULL, &pid, &error);
     
-    printf ("10\n");
     if (!succeeded)
     {
-    printf ("11\n");
       xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Failed to execute firejail to update property '%s': %s", property_name, error->message);
       g_warning ("Failed to execute firejail to update property '%s': %s\n", property_name, error->message);
       g_error_free (error);
@@ -745,11 +728,9 @@ xfce_sandbox_process_apply_workspace_prop (XfceSandboxProcess *proc,
     else
       xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Firejail successfully executed, property '%s' is now updated", property_name);
 
-    printf ("12\n");
     g_strfreev (argv);
     g_free (new_path);
     g_free (envp);
-    printf ("13\n");
 
     return succeeded;
 }
