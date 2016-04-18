@@ -33,13 +33,29 @@
 #include <stdlib.h>
 #endif
 
+#include <sys/types.h>
+#include <signal.h>
 #include <glib.h>
 #include <xfconf/xfconf.h>
+#include <garcon/garcon.h>
 #include <libxfce4ui/libxfce4ui.h>
 
 #include "debug.h"
 #include "firejail-sandboxes.h"
 
+/* No time to waste with a broken build chain */
+#ifndef XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_KEY
+#define XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_KEY "X-XfceFirejailBandwidthDownload"
+#endif
+#ifndef XFCE_FIREJAIL_BANDWIDTH_UPLOAD_KEY
+#define XFCE_FIREJAIL_BANDWIDTH_UPLOAD_KEY   "X-XfceFirejailBandwidthUpload"
+#endif
+#ifndef XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_DEFAULT
+#define XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_DEFAULT 200000
+#endif
+#ifndef XFCE_FIREJAIL_BANDWIDTH_UPLOAD_DEFAULT
+#define XFCE_FIREJAIL_BANDWIDTH_UPLOAD_DEFAULT   200000
+#endif
 
 /* Type of Xfce sandbox being treated (guessed from environment) */
 typedef enum {
@@ -84,6 +100,9 @@ static XfceSandboxProcess*  xfce_sandbox_process_new                      (pid_t
 static void                 xfce_sandbox_process_free                     (XfceSandboxProcess     *proc);
 static gboolean             xfce_sandbox_process_apply_workspace_prop     (XfceSandboxProcess     *proc,
                                                                            const gchar            *property_name);
+static gboolean         xfce_sandbox_process_apply_desktop_bandwidth_prop (XfceSandboxProcess     *proc,
+                                                                           gint                    download,
+                                                                           gint                    upload);
 static void                 xfce_sandbox_process_start_watching           (XfceSandboxProcess     *proc);
 
 
@@ -289,10 +308,10 @@ read_sandbox_env (const gchar *env_path, pid_t client_pid, XfceSandboxType *type
         value += 1;
 
         /* always apply the workspace type if found */
-          xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Sandbox %d: %s = %s\n", client_pid, buffer, value);
+//          xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Sandbox %d: %s = %s\n", client_pid, buffer, value);
         if (g_strcmp0 (buffer, "FIREJAIL_SANDBOX_WORKSPACE") == 0)
         {
-          xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Sandbox %d is a workspace sandbox: %s\n", client_pid, value);
+//          xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Sandbox %d is a workspace sandbox: %s\n", client_pid, value);
           *type = XFCE_SANDBOX_WORKSPACE;
         }
         else if (g_strcmp0 (buffer, "FIREJAIL_SANDBOX_NAME") == 0)
@@ -302,7 +321,7 @@ read_sandbox_env (const gchar *env_path, pid_t client_pid, XfceSandboxType *type
           /* only apply this one in absence of other types */
           if (*type == XFCE_SANDBOX_UNKNOWN)
           {
-            xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Sandbox %d is a desktop? sandbox: %s\n", client_pid, value);
+//            xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Sandbox %d is a desktop? sandbox: %s\n", client_pid, value);
             *type = XFCE_SANDBOX_DESKTOP;
           }
         }
@@ -315,7 +334,7 @@ read_sandbox_env (const gchar *env_path, pid_t client_pid, XfceSandboxType *type
 
     fclose(fp);
 
-    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Sandbox %d is a sandbox of name %s and type %d\n", client_pid, *name, *type);
+//    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Sandbox %d is a sandbox of name %s and type %d\n", client_pid, *name, *type);
     return;
 }
 
@@ -379,6 +398,15 @@ xfce_sandbox_poller_add_entry (XfceSandboxPoller *poller,
     pid = g_ascii_strtoll (name, NULL, 10);
     if (!pid)
       return FALSE;
+
+    if (kill (pid, 0))
+    {
+      if (errno == ESRCH)
+      {
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Sandbox directory %d corresponds to an app that already exited, ignoring.", pid);
+        return FALSE;
+      }
+    }
 
     xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Adding sandbox '%s'.", name);
     /* ignore entries we already have */
@@ -737,6 +765,102 @@ xfce_sandbox_process_apply_workspace_prop (XfceSandboxProcess *proc,
 
 
 
+static gboolean
+xfce_sandbox_process_apply_desktop_bandwidth_prop (XfceSandboxProcess *proc,
+                                                   gint                download,
+                                                   gint                upload)
+{
+    gchar    **argv = NULL;
+    gchar    **envp = NULL;
+    gchar     *new_path = NULL;
+    guint      n;
+    guint      n_envp;
+    gboolean   succeeded;
+    GError    *error = NULL;
+    GPid       pid;
+
+    g_return_val_if_fail (proc != NULL, FALSE);
+
+    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Applying bandwidth limits to desktop app %s", proc->name);
+
+    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Network property, about to execute Firejail");
+    argv = g_malloc0 (sizeof (char *) * 7);
+    argv[0] = g_strdup ("firejail");
+    argv[1] = g_strdup_printf ("--bandwidth=%s", proc->name);
+    argv[2] = g_strdup ("set");
+    argv[3] = g_strdup ("auto");
+    argv[4] = g_strdup_printf ("%d", download);
+    argv[5] = g_strdup_printf ("%d", upload);
+    argv[6] = NULL;
+
+    /* clean up path in the environment so we're confident the sandbox properly set up */
+    for (n = 0; environ && environ[n] != NULL; ++n);
+    envp = g_new0 (gchar *, n + 2);
+    for (n_envp = n = 0; environ[n] != NULL; ++n)
+    {
+      if (strncmp (environ[n], "DESKTOP_STARTUP_ID", 18) != 0
+          && strncmp (environ[n], "PATH", 4) != 0)
+        envp[n_envp++] = environ[n];
+    }
+    envp[n_envp++] = new_path = g_strdup ("PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin");
+
+    for (n = 0; argv[n]; n++)
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "argv[%d] -> %s", n, argv[n]);
+    succeeded = g_spawn_async (NULL, argv, envp, G_SPAWN_SEARCH_PATH_FROM_ENVP, NULL, NULL, &pid, &error);
+    
+    if (!succeeded)
+    {
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Failed to execute firejail to update bandwidth limits: %s", error->message);
+      g_warning ("Failed to execute firejail to update bandwidth limits: %s\n", error->message);
+      g_error_free (error);
+      error = NULL;
+    }
+    else
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Firejail successfully executed, bandwidth limits now updated");
+
+    g_strfreev (argv);
+    g_free (new_path);
+    g_free (envp);
+
+    return succeeded;
+}
+
+
+
+static gchar *
+find_desktop_path_from_name (XfceSandboxProcess *proc)
+{
+    GList *infos;
+    GList *iter;
+    gchar *path = NULL;
+
+    g_return_val_if_fail (proc != NULL, NULL);
+
+    infos = g_app_info_get_all ();
+
+    for (iter = infos; path == NULL && iter != NULL; iter = iter->next)
+    {
+      GAppInfo    *info = iter->data;
+      const gchar *info_name = g_app_info_get_name (info);
+
+      if (g_strcmp0 (info_name, proc->name) == 0 && G_IS_DESKTOP_APP_INFO (info))
+      {
+        path = g_strdup (g_desktop_app_info_get_filename (G_DESKTOP_APP_INFO (info)));
+        if (path == NULL)
+        {
+          xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Found a Desktop App Info that matches sandbox %d's name %s, but it did not have a filename.", proc->pid, proc->name);
+          g_warning ("Found a Desktop App Info that matches sandbox %d's name %s, but it did not have a filename.\n", proc->pid, proc->name);
+        }
+      }
+    }
+
+    g_list_free_full (infos, g_object_unref);
+
+    return path;
+}
+
+
+
 static void
 xfce_sandbox_process_start_watching (XfceSandboxProcess *proc)
 {
@@ -751,9 +875,66 @@ xfce_sandbox_process_start_watching (XfceSandboxProcess *proc)
       xfce_sandbox_process_apply_workspace_prop (proc, bandwidth);
       g_free (bandwidth);
     }
-    else if (proc->type == XFCE_SANDBOX_WORKSPACE)
+    else if (proc->type == XFCE_SANDBOX_DESKTOP)
     {
-      g_info ("Process %d from sandbox '%s' is likely a desktop app. No supported settings yet for desktop apps.\n", proc->pid, proc->name);
-      //TODO
+      gchar    *desktop_path;
+      GKeyFile *key_file;
+      GError   *error = NULL;
+      gboolean  sandboxed;
+      gint      dl, ul;
+
+      desktop_path = find_desktop_path_from_name (proc);
+      if (!desktop_path)
+      {
+        //TODO g_warning
+        //TODO remove from managed sandboxes
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "OOPS! did not find path for %s", proc->name);
+        return;
+      }
+
+      key_file = g_key_file_new ();
+      g_key_file_load_from_file (key_file, desktop_path, G_KEY_FILE_NONE, &error);
+      if (error)
+      {
+        //TODO g_warning
+        //TODO remove from managed sandboxes
+        g_error_free (error);
+        error = NULL;
+        //TODO free path
+        //TODO free file
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "OOPS! could not load file for %s", proc->name);
+        return;
+      }
+
+      sandboxed = g_key_file_get_boolean (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_RUN_IN_SANDBOX_KEY, &error);
+      if (error)
+      {
+        //TODO g_warning
+        //TODO remove from managed sandboxes
+        g_error_free (error);
+        error = NULL;
+        //TODO free path
+        //TODO free file
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "OOPS! could not find sandbox key for %s", proc->name);
+        return;
+      }
+
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Desktop file %s for process %s indicates the app is normally %ssandboxed.", desktop_path, proc->name, sandboxed? "":"not ");
+      if (!sandboxed)
+      {
+        //TODO g_warning
+        //TODO remove from managed sandboxes
+        //TODO free path
+        //TODO free file
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "OOPS! could not find sandbox key for %s", proc->name);
+        return;
+      }
+
+      dl = g_key_file_has_key (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_KEY, NULL)?
+                             g_key_file_get_integer (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_KEY, NULL) : XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_DEFAULT;
+      ul = g_key_file_has_key (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_UPLOAD_KEY, NULL)?
+                             g_key_file_get_integer (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_UPLOAD_KEY, NULL) : XFCE_FIREJAIL_BANDWIDTH_UPLOAD_DEFAULT;
+
+      xfce_sandbox_process_apply_desktop_bandwidth_prop (proc, dl, ul);
     }
 }

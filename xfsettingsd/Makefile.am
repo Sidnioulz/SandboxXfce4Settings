@@ -44,6 +44,7 @@ xfsettingsd_CFLAGS = \
 	$(GLIB_CFLAGS) \
 	$(GTHREAD_CFLAGS) \
 	$(GIO_CFLAGS) \
+	$(GARCON_CFLAGS) \
 	$(DBUS_GLIB_CFLAGS) \
 	$(XFCONF_CFLAGS) \
 	$(FIREJAILUTIL_CFLAGS) \
@@ -67,6 +68,7 @@ xfsettingsd_LDADD = \
 	$(GLIB_LIBS) \
 	$(GTHREAD_LIBS) \
 	$(GIO_LIBS) \
+	$(GARCON_LIBS) \
 	$(DBUS_GLIB_LIBS) \
 	$(XFCONF_LIBS) \
 	$(FIREJAILUTIL_LIBS) \
