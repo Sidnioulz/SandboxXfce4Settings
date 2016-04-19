@@ -69,6 +69,7 @@ typedef struct _XfceSandboxProcess {
     gchar           *name;
     XfceSandboxType  type;
     guint            ws_number;
+    gchar           *desktop_path;
 } XfceSandboxProcess;
 
 
@@ -77,12 +78,22 @@ static void                 xfce_sandbox_poller_dispose                   (GObje
 static void                 xfce_sandbox_poller_finalize                  (GObject                *object);
 static gboolean             xfce_sandbox_poller_initial_load              (XfceSandboxPoller      *poller,
                                                                            GError                **error);
+static gboolean             xfce_sandbox_poller_add_entry_from_pid        (XfceSandboxPoller      *poller,
+                                                                           pid_t                   pid,
+                                                                           gboolean               *retry);
 static gboolean             xfce_sandbox_poller_add_entry                 (XfceSandboxPoller      *poller,
                                                                            const gchar            *name,
                                                                            gboolean               *retry);
+static gboolean             xfce_sandbox_poller_remove_entry_from_pid     (XfceSandboxPoller      *poller,
+                                                                           pid_t                   pid);
 static gboolean             xfce_sandbox_poller_remove_entry              (XfceSandboxPoller      *poller,
                                                                            const gchar            *name);
 static void                 xfce_sandbox_poller_on_file_changed           (GFileMonitor           *monitor,
+                                                                           GFile                  *file,
+                                                                           GFile                  *other_file,
+                                                                           GFileMonitorEvent       event_type,
+                                                                           gpointer                user_data);
+static void                 xfce_sandbox_poller_on_desktop_changed        (GFileMonitor           *monitor,
                                                                            GFile                  *file,
                                                                            GFile                  *other_file,
                                                                            GFileMonitorEvent       event_type,
@@ -100,10 +111,8 @@ static XfceSandboxProcess*  xfce_sandbox_process_new                      (pid_t
 static void                 xfce_sandbox_process_free                     (XfceSandboxProcess     *proc);
 static gboolean             xfce_sandbox_process_apply_workspace_prop     (XfceSandboxProcess     *proc,
                                                                            const gchar            *property_name);
-static gboolean         xfce_sandbox_process_apply_desktop_bandwidth_prop (XfceSandboxProcess     *proc,
-                                                                           gint                    download,
-                                                                           gint                    upload);
-static void                 xfce_sandbox_process_start_watching           (XfceSandboxProcess     *proc);
+static gboolean             xfce_sandbox_process_apply_desktop_props      (XfceSandboxProcess     *proc);
+static gboolean             xfce_sandbox_process_start_watching           (XfceSandboxProcess     *proc);
 
 
 
@@ -120,6 +129,9 @@ struct _XfceSandboxPoller
     GHashTable         *sandboxes;
     XfconfChannel      *channel;
     GFileMonitor       *monitor;
+    GFileMonitor       *app_monitor;
+    GFileMonitor       *local_app_monitor;
+    GFileMonitor       *home_app_monitor;
     guint               handler;
 };
 
@@ -173,6 +185,11 @@ xfce_sandbox_poller_dispose (GObject *object)
         poller->handler = 0;
     }
 
+    g_signal_handlers_disconnect_by_func (poller->monitor, xfce_sandbox_poller_on_file_changed, poller);
+    g_signal_handlers_disconnect_by_func (poller->app_monitor, xfce_sandbox_poller_on_desktop_changed, poller);
+    g_signal_handlers_disconnect_by_func (poller->local_app_monitor, xfce_sandbox_poller_on_desktop_changed, poller);
+    g_signal_handlers_disconnect_by_func (poller->home_app_monitor, xfce_sandbox_poller_on_desktop_changed, poller);
+
     xfce_sandbox_poller_unload (poller);
 
     (*G_OBJECT_CLASS (xfce_sandbox_poller_parent_class)->dispose) (object);
@@ -189,6 +206,13 @@ xfce_sandbox_poller_finalize (GObject *object)
 
     g_hash_table_destroy (poller->sandboxes);
     g_object_unref (poller->channel);
+    
+    g_object_unref (poller->monitor);
+    g_object_unref (poller->app_monitor);
+    g_object_unref (poller->local_app_monitor);
+    g_object_unref (poller->home_app_monitor);
+
+    g_hash_table_destroy (poller->sandboxes);
 
     (*G_OBJECT_CLASS (xfce_sandbox_poller_parent_class)->finalize) (object);
     xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Finished finalizing the sandbox poller.");
@@ -378,26 +402,16 @@ xfce_sandbox_poller_add_entry_idle (gpointer user_data)
 
 
 static gboolean
-xfce_sandbox_poller_add_entry (XfceSandboxPoller *poller,
-                               const gchar       *name,
-                               gboolean          *retry)
+xfce_sandbox_poller_add_entry_from_pid (XfceSandboxPoller *poller,
+                                        pid_t              pid,
+                                        gboolean          *retry)
 {
     XfceSandboxProcess *proc;
     XfceSandboxType     type;
-    pid_t               pid;
     gchar              *path;
     gchar              *sandbox_name;
 
     g_return_val_if_fail (XFCE_IS_SANDBOX_POLLER (poller), FALSE);
-    g_return_val_if_fail (name != NULL, FALSE);
-
-    /* ignore the "self" entry */
-    if (g_strcmp0 ("self", name) == 0)
-      return FALSE;
-
-    pid = g_ascii_strtoll (name, NULL, 10);
-    if (!pid)
-      return FALSE;
 
     if (kill (pid, 0))
     {
@@ -408,20 +422,20 @@ xfce_sandbox_poller_add_entry (XfceSandboxPoller *poller,
       }
     }
 
-    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Adding sandbox '%s'.", name);
+    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Adding sandbox '%d'.", pid);
     /* ignore entries we already have */
     if (g_hash_table_contains (poller->sandboxes, GUINT_TO_POINTER (pid)))
     {
-      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Sandbox '%s' already added, ignoring.", name);
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Sandbox '%d' already added, ignoring.", pid);
       return FALSE;
     }
 
     /* ignore entries that don't seem to have the environment file we need */
-    path = g_strdup_printf ("%s/%s/%s", poller->rundir_path, name, DOMAIN_ENV_FILE);
+    path = g_strdup_printf ("%s/%d/%s", poller->rundir_path, pid, DOMAIN_ENV_FILE);
     if (!g_file_test (path, G_FILE_TEST_IS_REGULAR))
     {
-      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Missing environment file at '%s' for sandbox '%s', cannot manage its settings.", path, name);
-      g_warning ("Missing environment file at '%s' for sandbox '%s', cannot manage its settings.\n", path, name);
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Missing environment file at '%s' for sandbox '%d', cannot manage its settings.", path, pid);
+      g_warning ("Missing environment file at '%s' for sandbox '%d', cannot manage its settings.\n", path, pid);
 
       g_free (path);
 
@@ -435,8 +449,8 @@ xfce_sandbox_poller_add_entry (XfceSandboxPoller *poller,
     read_sandbox_env (path, pid, &type, &sandbox_name);
     if (type == XFCE_SANDBOX_UNKNOWN)
     {
-      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Could not determine type of sandbox for sandbox '%s', cannot manage its settings.", name);
-      g_warning ("Could not determine type of sandbox for sandbox '%s', cannot manage its settings.\n", name);
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Could not determine type of sandbox for sandbox '%d', cannot manage its settings.", pid);
+      g_warning ("Could not determine type of sandbox for sandbox '%d', cannot manage its settings.\n", pid);
 
       /* This file is not immediately available on sandbox startup, give it a second and retry */
       if (retry)
@@ -448,14 +462,54 @@ xfce_sandbox_poller_add_entry (XfceSandboxPoller *poller,
 
     /* create a process struct and add it to our list of monitored processes */
     proc = xfce_sandbox_process_new (pid, sandbox_name, type);
-    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Adding proc object for sandbox '%s', named '%s' and of type %s.", name, sandbox_name, type == XFCE_SANDBOX_WORKSPACE? "Workspace":"Desktop app");
+    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Adding proc object for sandbox '%d', named '%s' and of type %s.", pid, sandbox_name, type == XFCE_SANDBOX_WORKSPACE? "Workspace":"Desktop app");
     g_free (sandbox_name);
 
-    xfce_sandbox_process_start_watching (proc);
-    g_hash_table_insert (poller->sandboxes, GUINT_TO_POINTER (pid), proc);
+    if (xfce_sandbox_process_start_watching (proc))
+      g_hash_table_insert (poller->sandboxes, GUINT_TO_POINTER (pid), proc);
+    else
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Proc object for sandbox '%d' cannot be watched, not adding proc object to list of managed sandboxes.", pid);
 
     g_free (path);
     return TRUE;
+}
+
+
+
+static gboolean
+xfce_sandbox_poller_add_entry (XfceSandboxPoller *poller,
+                               const gchar       *name,
+                               gboolean          *retry)
+{
+    pid_t               pid;
+
+    g_return_val_if_fail (XFCE_IS_SANDBOX_POLLER (poller), FALSE);
+    g_return_val_if_fail (name != NULL, FALSE);
+
+    /* ignore the "self" entry */
+    if (g_strcmp0 ("self", name) == 0)
+      return FALSE;
+
+    pid = g_ascii_strtoll (name, NULL, 10);
+    if (!pid)
+      return FALSE;
+    else
+      return xfce_sandbox_poller_add_entry_from_pid (poller, pid, retry);
+}
+
+
+
+static gboolean
+xfce_sandbox_poller_remove_entry_from_pid (XfceSandboxPoller *poller,
+                                           pid_t              pid)
+{
+    g_return_val_if_fail (XFCE_IS_SANDBOX_POLLER (poller), FALSE);
+
+    /* ignore entries we already have */
+    if (g_hash_table_contains (poller->sandboxes, GUINT_TO_POINTER (pid)))
+      return g_hash_table_remove (poller->sandboxes, GUINT_TO_POINTER (pid));
+
+    return FALSE;
 }
 
 
@@ -476,12 +530,8 @@ xfce_sandbox_poller_remove_entry (XfceSandboxPoller *poller,
     pid = g_ascii_strtoll (name, NULL, 10);
     if (!pid)
       return FALSE;
-
-    /* ignore entries we already have */
-    if (g_hash_table_contains (poller->sandboxes, GUINT_TO_POINTER (pid)))
-      return g_hash_table_remove (poller->sandboxes, GUINT_TO_POINTER (pid));
-
-    return FALSE;
+    else
+      return xfce_sandbox_poller_remove_entry_from_pid (poller, pid);
 }
 
 
@@ -540,43 +590,43 @@ xfce_sandbox_poller_on_file_changed (GFileMonitor     *monitor,
                                      GFileMonitorEvent event_type,
                                      gpointer          user_data)
 {
-  XfceSandboxPoller *poller = (XfceSandboxPoller *) user_data;
-  gchar             *filename;
+    XfceSandboxPoller *poller = (XfceSandboxPoller *) user_data;
+    gchar             *filename;
 
-  g_return_if_fail (XFCE_IS_SANDBOX_POLLER (poller));
+    g_return_if_fail (XFCE_IS_SANDBOX_POLLER (poller));
 
-  filename = g_file_get_basename (file);
+    filename = g_file_get_basename (file);
 
-  if (event_type == G_FILE_MONITOR_EVENT_CREATED)
-  {
-      XfceSandboxAddEntryIdleData *data = g_malloc (sizeof (XfceSandboxAddEntryIdleData));
+    if (event_type == G_FILE_MONITOR_EVENT_CREATED)
+    {
+        XfceSandboxAddEntryIdleData *data = g_malloc (sizeof (XfceSandboxAddEntryIdleData));
 
-      data->poller = poller;
-      data->name = g_strdup (filename);
-      data->try_counter = 0;
+        data->poller = poller;
+        data->name = g_strdup (filename);
+        data->try_counter = 0;
 
-      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' created, adding it in a few moments", filename);
-      g_timeout_add_seconds (1, xfce_sandbox_poller_add_entry_idle, data);
-  }
-  else if (event_type == G_FILE_MONITOR_EVENT_DELETED)
-  {
-      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' deleted", filename);
-      xfce_sandbox_poller_remove_entry (poller, filename);
-  }
-  else if (event_type == G_FILE_MONITOR_EVENT_PRE_UNMOUNT)
-      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' about to be unmounted", filename);
-  else if (event_type == G_FILE_MONITOR_EVENT_UNMOUNTED)
-      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' unmounted", filename);
-  else if (event_type == G_FILE_MONITOR_EVENT_MOVED)
-      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' moved", filename);
-  else if (event_type == G_FILE_MONITOR_EVENT_MOVED_IN)
-      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' moved in", filename);
-  else if (event_type == G_FILE_MONITOR_EVENT_MOVED_OUT)
-      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' moved out", filename);
-  else if (event_type == G_FILE_MONITOR_EVENT_RENAMED)
-      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' renamed", filename);
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' created, adding it in a few moments", filename);
+        g_timeout_add_seconds (1, xfce_sandbox_poller_add_entry_idle, data);
+    }
+    else if (event_type == G_FILE_MONITOR_EVENT_DELETED)
+    {
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' deleted", filename);
+        xfce_sandbox_poller_remove_entry (poller, filename);
+    }
+    else if (event_type == G_FILE_MONITOR_EVENT_PRE_UNMOUNT)
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' about to be unmounted", filename);
+    else if (event_type == G_FILE_MONITOR_EVENT_UNMOUNTED)
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' unmounted", filename);
+    else if (event_type == G_FILE_MONITOR_EVENT_MOVED)
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' moved", filename);
+    else if (event_type == G_FILE_MONITOR_EVENT_MOVED_IN)
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' moved in", filename);
+    else if (event_type == G_FILE_MONITOR_EVENT_MOVED_OUT)
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' moved out", filename);
+    else if (event_type == G_FILE_MONITOR_EVENT_RENAMED)
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "File '%s' renamed", filename);
 
-  g_free (filename);
+    g_free (filename);
 }
 
 
@@ -586,6 +636,7 @@ xfce_sandbox_poller_reload (XfceSandboxPoller *poller)
 {
     GError *error = NULL;
     GFile  *file;
+    gchar  *home_path;
 
     xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Reloading all sandboxes.");
     g_return_if_fail (XFCE_IS_SANDBOX_POLLER (poller));
@@ -596,6 +647,18 @@ xfce_sandbox_poller_reload (XfceSandboxPoller *poller)
       xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "... suspending existing file monitor");
       g_object_unref (poller->monitor);
       poller->monitor = NULL;
+    }
+    if (poller->app_monitor)
+    {
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "... suspending existing AppInfo monitor");
+      g_object_unref (poller->app_monitor);
+      poller->app_monitor = NULL;
+    }
+    if (poller->local_app_monitor)
+    {
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "... suspending existing local AppInfo monitor");
+      g_object_unref (poller->local_app_monitor);
+      poller->local_app_monitor = NULL;
     }
 
     if (g_hash_table_size (poller->sandboxes) != 0)
@@ -631,6 +694,56 @@ xfce_sandbox_poller_reload (XfceSandboxPoller *poller)
       g_signal_connect (G_OBJECT (poller->monitor), "changed", G_CALLBACK (xfce_sandbox_poller_on_file_changed), poller);
     }
 
+    /* watch for changes to sandboxed Desktop apps */
+    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "... loading new AppInfo monitor.");
+    file = g_file_new_for_path ("/usr/share/applications");
+    poller->app_monitor = g_file_monitor_directory (file, G_FILE_MONITOR_NONE, NULL, &error);
+    if (error)
+    {
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Failed to load AppInfo monitor. May not automatically update settings to Desktop app sandboxes. Reason: %s", error->message);
+      g_warning ("Failed to load AppInfo monitor. May not automatically update settings to Desktop app sandboxes. Reason: %s\n", error->message);
+      g_error_free (error);
+      error = NULL;
+    }
+    else
+    {
+      g_signal_connect (G_OBJECT (poller->app_monitor), "changed", G_CALLBACK (xfce_sandbox_poller_on_desktop_changed), poller);
+    }
+
+    /* watch for changes to sandboxed Desktop apps */
+    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "... loading new AppInfo monitor.");
+    file = g_file_new_for_path ("/usr/local/share/applications");
+    poller->local_app_monitor = g_file_monitor_directory (file, G_FILE_MONITOR_NONE, NULL, &error);
+    if (error)
+    {
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Failed to load AppInfo monitor. May not automatically update settings to Desktop app sandboxes. Reason: %s", error->message);
+      g_warning ("Failed to load AppInfo monitor. May not automatically update settings to Desktop app sandboxes. Reason: %s\n", error->message);
+      g_error_free (error);
+      error = NULL;
+    }
+    else
+    {
+      g_signal_connect (G_OBJECT (poller->local_app_monitor), "changed", G_CALLBACK (xfce_sandbox_poller_on_desktop_changed), poller);
+    }
+
+    /* watch for changes to sandboxed Desktop apps */
+    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "... loading new AppInfo monitor.");
+    home_path = g_strdup_printf ("%s/applications", g_get_user_data_dir ());
+    file = g_file_new_for_path (home_path);
+    g_free (home_path);
+    poller->home_app_monitor = g_file_monitor_directory (file, G_FILE_MONITOR_NONE, NULL, &error);
+    if (error)
+    {
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Failed to load AppInfo monitor. May not automatically update settings to Desktop app sandboxes. Reason: %s", error->message);
+      g_warning ("Failed to load AppInfo monitor. May not automatically update settings to Desktop app sandboxes. Reason: %s\n", error->message);
+      g_error_free (error);
+      error = NULL;
+    }
+    else
+    {
+      g_signal_connect (G_OBJECT (poller->home_app_monitor), "changed", G_CALLBACK (xfce_sandbox_poller_on_desktop_changed), poller);
+    }
+
     xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Finished reloading.");
 }
 
@@ -639,7 +752,9 @@ xfce_sandbox_poller_reload (XfceSandboxPoller *poller)
 static void
 xfce_sandbox_poller_unload (XfceSandboxPoller *poller)
 {
-    //TODO
+    g_return_if_fail (XFCE_IS_SANDBOX_POLLER (poller));
+
+    g_hash_table_remove_all (poller->sandboxes);
 }
 
 
@@ -665,6 +780,8 @@ xfce_sandbox_process_new (pid_t            pid,
     else
       proc->ws_number = 0;
 
+    proc->desktop_path = NULL;
+
     return proc;
 }
 
@@ -674,6 +791,9 @@ static void
 xfce_sandbox_process_free (XfceSandboxProcess *proc)
 {
     g_return_if_fail (proc != NULL);
+
+    if (proc->desktop_path)
+      g_free (proc->desktop_path);
 
     g_free (proc->name);
     g_free (proc);
@@ -766,10 +886,10 @@ xfce_sandbox_process_apply_workspace_prop (XfceSandboxProcess *proc,
 
 
 static gboolean
-xfce_sandbox_process_apply_desktop_bandwidth_prop (XfceSandboxProcess *proc,
-                                                   gint                download,
-                                                   gint                upload)
+xfce_sandbox_process_apply_desktop_props (XfceSandboxProcess *proc)
 {
+    GKeyFile  *key_file;
+    gint       dl, ul;
     gchar    **argv = NULL;
     gchar    **envp = NULL;
     gchar     *new_path = NULL;
@@ -780,8 +900,25 @@ xfce_sandbox_process_apply_desktop_bandwidth_prop (XfceSandboxProcess *proc,
     GPid       pid;
 
     g_return_val_if_fail (proc != NULL, FALSE);
+    g_return_val_if_fail (proc->desktop_path != NULL, FALSE);
+    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Applying settings for desktop app %s", proc->name);
+    
+    key_file = g_key_file_new ();
+    g_key_file_load_from_file (key_file, proc->desktop_path, G_KEY_FILE_NONE, &error);
+    if (error)
+    {
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Could not load Desktop app %s 's .desktop file: %s. Not managing sandbox %d's settings.", proc->name, error->message, proc->pid);
+      g_warning ("Could not load Desktop app %s 's .desktop file: %s. Not managing sandbox %d's settings.\n", proc->name, error->message, proc->pid);
+      g_error_free (error);
+      error = NULL;
+      return FALSE;
+    }
 
     xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Applying bandwidth limits to desktop app %s", proc->name);
+    dl = g_key_file_has_key (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_KEY, NULL)?
+                           g_key_file_get_integer (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_KEY, NULL) : XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_DEFAULT;
+    ul = g_key_file_has_key (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_UPLOAD_KEY, NULL)?
+                           g_key_file_get_integer (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_UPLOAD_KEY, NULL) : XFCE_FIREJAIL_BANDWIDTH_UPLOAD_DEFAULT;
 
     xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Network property, about to execute Firejail");
     argv = g_malloc0 (sizeof (char *) * 7);
@@ -789,8 +926,8 @@ xfce_sandbox_process_apply_desktop_bandwidth_prop (XfceSandboxProcess *proc,
     argv[1] = g_strdup_printf ("--bandwidth=%s", proc->name);
     argv[2] = g_strdup ("set");
     argv[3] = g_strdup ("auto");
-    argv[4] = g_strdup_printf ("%d", download);
-    argv[5] = g_strdup_printf ("%d", upload);
+    argv[4] = g_strdup_printf ("%d", dl);
+    argv[5] = g_strdup_printf ("%d", ul);
     argv[6] = NULL;
 
     /* clean up path in the environment so we're confident the sandbox properly set up */
@@ -821,6 +958,7 @@ xfce_sandbox_process_apply_desktop_bandwidth_prop (XfceSandboxProcess *proc,
     g_strfreev (argv);
     g_free (new_path);
     g_free (envp);
+    g_key_file_free (key_file);
 
     return succeeded;
 }
@@ -862,9 +1000,87 @@ find_desktop_path_from_name (XfceSandboxProcess *proc)
 
 
 static void
+xfce_sandbox_poller_on_desktop_changed (GFileMonitor     *monitor,
+                                        GFile            *file,
+                                        GFile            *other_file,
+                                        GFileMonitorEvent event_type,
+                                        gpointer          user_data)
+{
+    XfceSandboxPoller  *poller = (XfceSandboxPoller *) user_data;
+    GDesktopAppInfo    *appinfo = NULL;
+    gchar              *new_path = NULL;
+    const gchar        *name = NULL;
+    GHashTableIter      iter;
+    gpointer            key, value;
+    pid_t               pending = 0;
+    XfceSandboxProcess *proc;
+
+    if (!(event_type == G_FILE_MONITOR_EVENT_CHANGED ||
+          event_type == G_FILE_MONITOR_EVENT_DELETED ||
+          event_type == G_FILE_MONITOR_EVENT_CREATED))
+        return;
+
+    /* Verify the file is an appinfo */
+    new_path = g_file_get_path (file);
+    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "A .desktop file changed: %s.", new_path);
+
+    appinfo = g_desktop_app_info_new_from_filename (new_path);
+    if (!appinfo)
+    {
+        g_free (new_path);
+        return;
+    }
+
+    /* Find out if a sandbox with the same name exists */
+    name = g_app_info_get_name (G_APP_INFO (appinfo));
+    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "The .desktop file changed corresponds to Desktop app '%s'.", name);
+
+    g_hash_table_iter_init (&iter, poller->sandboxes);
+    while (g_hash_table_iter_next (&iter, &key, &value) && !pending)
+    {
+        proc = (XfceSandboxProcess *) value;
+        if (g_strcmp0 (proc->name, name) == 0)
+            pending = GPOINTER_TO_UINT (key);
+    }
+
+    g_object_unref (appinfo);
+
+    if (!pending)
+    {
+        g_free (new_path);
+        return;
+    }
+
+    xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "A matching process (PID %d) was found for Desktop app '%s'.", pending, proc->name);
+
+    /* Just gotta re-read the same file */
+    if (g_strcmp0 (proc->desktop_path, new_path) == 0 && (event_type == G_FILE_MONITOR_EVENT_CHANGED || event_type == G_FILE_MONITOR_EVENT_CREATED))
+    {
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Reloading settings for process %d...", pending);
+        xfce_sandbox_process_apply_desktop_props (proc);
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Done reloading settings for process %d...", pending);
+    }
+
+    /* Depending on the GAppinfo path traversal logic, the created file might
+       supersede the existing one for our sandbox, or another file might replace
+       the deleted file. Just re-add the sandbox */
+    if (event_type != G_FILE_MONITOR_EVENT_CHANGED)
+    {
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Reloading process %d entirely...", pending);
+        if (xfce_sandbox_poller_remove_entry_from_pid (poller, pending))
+            xfce_sandbox_poller_add_entry_from_pid (poller, pending, NULL);
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Done reloading process %d entirely...", pending);
+    }
+
+    g_free (new_path);
+}
+
+
+
+static gboolean
 xfce_sandbox_process_start_watching (XfceSandboxProcess *proc)
 {
-    g_return_if_fail (proc != NULL);
+    g_return_val_if_fail (proc != NULL, FALSE);
     xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Starting to watch sandbox '%s'", proc->name);
 
     if (proc->type == XFCE_SANDBOX_WORKSPACE)
@@ -874,67 +1090,25 @@ xfce_sandbox_process_start_watching (XfceSandboxProcess *proc)
       bandwidth = g_strdup_printf ("/security/workspace_%d/bandwidth_upload", proc->ws_number);
       xfce_sandbox_process_apply_workspace_prop (proc, bandwidth);
       g_free (bandwidth);
+
+      return TRUE;
     }
     else if (proc->type == XFCE_SANDBOX_DESKTOP)
     {
       gchar    *desktop_path;
-      GKeyFile *key_file;
-      GError   *error = NULL;
-      gboolean  sandboxed;
-      gint      dl, ul;
 
       desktop_path = find_desktop_path_from_name (proc);
       if (!desktop_path)
       {
-        //TODO g_warning
-        //TODO remove from managed sandboxes
-        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "OOPS! did not find path for %s", proc->name);
-        return;
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Could not find the Desktop app corresponding to sandbox name %s. Not managing sandbox %d's settings.", proc->name, proc->pid);
+        g_warning ("Could not find the Desktop app corresponding to sandbox name %s. Not managing sandbox %d's settings.\n", proc->name, proc->pid);
+        return FALSE;
       }
 
-      key_file = g_key_file_new ();
-      g_key_file_load_from_file (key_file, desktop_path, G_KEY_FILE_NONE, &error);
-      if (error)
-      {
-        //TODO g_warning
-        //TODO remove from managed sandboxes
-        g_error_free (error);
-        error = NULL;
-        //TODO free path
-        //TODO free file
-        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "OOPS! could not load file for %s", proc->name);
-        return;
-      }
+      proc->desktop_path = desktop_path;
 
-      sandboxed = g_key_file_get_boolean (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_RUN_IN_SANDBOX_KEY, &error);
-      if (error)
-      {
-        //TODO g_warning
-        //TODO remove from managed sandboxes
-        g_error_free (error);
-        error = NULL;
-        //TODO free path
-        //TODO free file
-        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "OOPS! could not find sandbox key for %s", proc->name);
-        return;
-      }
-
-      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Desktop file %s for process %s indicates the app is normally %ssandboxed.", desktop_path, proc->name, sandboxed? "":"not ");
-      if (!sandboxed)
-      {
-        //TODO g_warning
-        //TODO remove from managed sandboxes
-        //TODO free path
-        //TODO free file
-        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "OOPS! could not find sandbox key for %s", proc->name);
-        return;
-      }
-
-      dl = g_key_file_has_key (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_KEY, NULL)?
-                             g_key_file_get_integer (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_KEY, NULL) : XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_DEFAULT;
-      ul = g_key_file_has_key (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_UPLOAD_KEY, NULL)?
-                             g_key_file_get_integer (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_UPLOAD_KEY, NULL) : XFCE_FIREJAIL_BANDWIDTH_UPLOAD_DEFAULT;
-
-      xfce_sandbox_process_apply_desktop_bandwidth_prop (proc, dl, ul);
+      return xfce_sandbox_process_apply_desktop_props (proc);
     }
+
+    return FALSE;
 }
