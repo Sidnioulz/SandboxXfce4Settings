@@ -44,6 +44,9 @@
 #include "firejail-sandboxes.h"
 
 /* No time to waste with a broken build chain */
+#ifndef XFCE_FIREJAIL_ENABLE_NETWORK_KEY
+#define XFCE_FIREJAIL_ENABLE_NETWORK_KEY     "X-XfceFirejailEnableNetwork"
+#endif
 #ifndef XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_KEY
 #define XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_KEY "X-XfceFirejailBandwidthDownload"
 #endif
@@ -828,6 +831,13 @@ xfce_sandbox_process_apply_workspace_prop (XfceSandboxProcess *proc,
     /* find out if the modified property is managed by xfsettingsd, if so, build a command */
     if (g_strcmp0 (key, "bandwidth_download") == 0 || g_strcmp0 (key, "bandwidth_upload") == 0)
     {
+      /* Exit if there is no Internet connection in the sandbox */
+      if (!xfce_workspace_enable_network (proc->ws_number))
+      {
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Network property, but Workspace %d does not have an Internet connection, nothing to do", proc->ws_number);
+        return TRUE;
+      }
+
       xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Network property, about to execute Firejail");
       argv = g_malloc0 (sizeof (char *) * 7);
       argv[0] = g_strdup ("firejail");
@@ -915,6 +925,16 @@ xfce_sandbox_process_apply_desktop_props (XfceSandboxProcess *proc)
     }
 
     xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Applying bandwidth limits to desktop app %s", proc->name);
+
+    /* Exit if there is no Internet connection in the sandbox */
+    if (g_key_file_has_key (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_ENABLE_NETWORK_KEY, NULL) &&
+        !g_key_file_get_boolean (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_ENABLE_NETWORK_KEY, NULL))
+    {
+      xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Desktop app %s does not have an Internet connection, nothing to do", proc->name);
+      g_key_file_free (key_file);
+      return TRUE;
+    }
+
     dl = g_key_file_has_key (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_KEY, NULL)?
                            g_key_file_get_integer (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_KEY, NULL) : XFCE_FIREJAIL_BANDWIDTH_DOWNLOAD_DEFAULT;
     ul = g_key_file_has_key (key_file, G_KEY_FILE_DESKTOP_GROUP, XFCE_FIREJAIL_BANDWIDTH_UPLOAD_KEY, NULL)?
