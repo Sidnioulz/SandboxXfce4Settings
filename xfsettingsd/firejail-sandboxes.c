@@ -832,9 +832,9 @@ xfce_sandbox_process_apply_workspace_prop (XfceSandboxProcess *proc,
     if (g_strcmp0 (key, "bandwidth_download") == 0 || g_strcmp0 (key, "bandwidth_upload") == 0)
     {
       /* Exit if there is no Internet connection in the sandbox */
-      if (!xfce_workspace_enable_network (proc->ws_number))
+      if (!xfce_workspace_fine_tuned_network (proc->ws_number))
       {
-        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Network property, but Workspace %d does not have an Internet connection, nothing to do", proc->ws_number);
+        xfsettings_dbg (XFSD_DEBUG_FIREJAIL, "Network property, but Workspace %d does not have bandwidth control enabled, nothing to do", proc->ws_number);
         return TRUE;
       }
 
